@@ -38,6 +38,8 @@ pub mod android {
     use std::path::PathBuf;
     use std::sync::Mutex;
 
+    use rocket::Shutdown;
+
     use crate::config::AWConfig;
     use crate::endpoints;
     use crate::endpoints::ServerState;
@@ -46,6 +48,12 @@ pub mod android {
 
     static mut DATASTORE: Option<Datastore> = None;
     static mut SERVER_HOST: Option<String> = None;
+
+    // Rocket's Shutdown handle. Captured on the rocket task before `.launch()`
+    // and consumed from the JNI thread via `stopServer`. Must be a real Mutex
+    // (not `static mut`) because writer (rocket task) and reader (JNI thread)
+    // are different OS threads. See QLI-674.
+    static SHUTDOWN_HANDLE: Mutex<Option<Shutdown>> = Mutex::new(None);
 
     unsafe fn openDatastore() -> Datastore {
         match DATASTORE {
@@ -133,9 +141,32 @@ pub mod android {
                 .unwrap_or_else(|| "127.0.0.1".to_string());
             server_config.port = 5600;
 
-            endpoints::build_rocket(server_state, server_config)
-                .launch()
-                .await;
+            // `shutdown()` lives on `Rocket<Ignite>`, so explicitly ignite
+            // before launching so we can stash the handle.
+            let rocket = endpoints::build_rocket(server_state, server_config)
+                .ignite()
+                .await
+                .expect("rocket ignite failed");
+            *SHUTDOWN_HANDLE.lock().unwrap() = Some(rocket.shutdown());
+            let _ = rocket.launch().await;
+            // Clear the slot so a future startServer doesn't notify a stale handle.
+            *SHUTDOWN_HANDLE.lock().unwrap() = None;
+        }
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_stopServer(
+        _env: JNIEnv,
+        _: JClass,
+    ) {
+        match SHUTDOWN_HANDLE.lock().unwrap().take() {
+            Some(handle) => {
+                info!("stopServer: notifying rocket shutdown");
+                handle.notify();
+            }
+            None => {
+                info!("stopServer: no shutdown handle stashed (server not running)");
+            }
         }
     }
 
